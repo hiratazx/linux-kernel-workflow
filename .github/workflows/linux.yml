@@ -44,14 +44,11 @@ jobs:
         TARGET_DIR="kernel-source"
 
         # Determine the effective branch name for caching and logging.
-        # If 'branch' input is empty, fetch the default branch (HEAD) of the remote repository.
+        # If 'branch' input is empty, use a placeholder for caching,
+        # and let git clone handle the default branch.
         EFFECTIVE_BRANCH="$BRANCH"
         if [ -z "$BRANCH" ]; then
-          echo "No specific branch provided. Fetching default branch from $REPO_URL..."
-          # Use git ls-remote to find the default branch (usually 'main' or 'master')
-          DEFAULT_BRANCH=$(git ls-remote --symref "$REPO_URL" HEAD | awk '/HEAD/ {print $1}' | sed 's/refs\/heads\///')
-          EFFECTIVE_BRANCH="$DEFAULT_BRANCH"
-          echo "Using default branch: $EFFECTIVE_BRANCH"
+          echo "No specific branch provided. 'git clone' will fetch the default branch."
         else
           echo "Using specified branch: $EFFECTIVE_BRANCH"
         fi
@@ -88,7 +85,7 @@ jobs:
           git clone "$REPO_URL" "$TARGET_DIR"
         else
           # Clone a specific branch
-          git clone -b "$BRANCH" "$REPO_DIR" "$TARGET_DIR"
+          git clone -b "$BRANCH" "$REPO_URL" "$TARGET_DIR" # Corrected variable name from $REPO_DIR to $REPO_URL
         fi
         cd "$TARGET_DIR"
         # Crucial for some kernel trees that use submodules (e.g., for firmware or tools)
@@ -107,14 +104,11 @@ jobs:
             sudo apt-get update
             # Install common build tools and 'rpm' utility on Ubuntu
             sudo apt-get install -y build-essential libncurses-dev flex bison libssl-dev libelf-dev dwarves bc rsync rpm
-            # Note: For a truly native RPM build environment, consider using a Fedora/CentOS runner.
             ;;
           "archlinux-compatible")
             sudo apt-get update
             # Common kernel build dependencies for Arch-like systems
             sudo apt-get install -y build-essential libncurses-dev flex bison libssl-dev libelf-dev dwarves bc rsync
-            # Note: For a truly native Arch build environment, consider using an Arch Linux runner
-            # and installing 'base-devel' group via pacman.
             ;;
         esac
 
