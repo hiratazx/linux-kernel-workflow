@@ -76,10 +76,16 @@ jobs:
       # Only clone if the cache was not hit
       if: steps.cache-kernel.outputs.cache-hit != 'true'
       run: |
-        # Use inputs from workflow_dispatch
         REPO_URL="${{ github.event.inputs.kernel_source_repo }}"
         BRANCH="${{ github.event.inputs.branch }}"
         TARGET_DIR="${{ steps.setup-source.outputs.target_dir }}"
+
+        echo "Checking if $TARGET_DIR exists and cleaning if necessary..."
+        if [ -d "$TARGET_DIR" ]; then
+          echo "$TARGET_DIR already exists. Removing its contents to ensure a clean clone."
+          rm -rf "$TARGET_DIR"/* "$TARGET_DIR"/.* 2>/dev/null || true # Remove contents, ignore errors for hidden files
+        fi
+        mkdir -p "$TARGET_DIR" # Ensure the directory exists but is empty
 
         echo "Cloning $REPO_URL into $TARGET_DIR..."
         if [ -z "$BRANCH" ]; then
