@@ -1,0 +1,188 @@
+name: Linux Kernel Compiler
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+  workflow_dispatch: # Allows manual triggering of the workflow from the GitHub UI
+    inputs:
+      kernel_source_repo:
+        description: 'Git repository URL for the kernel source'
+        required: true
+        default: 'https://github.com/torvalds/linux.git' # Default kernel source
+      branch:
+        description: 'Branch of the kernel repository (leave empty for default branch)'
+        required: false
+        default: '' # Empty string means use the default branch of the repo
+
+jobs:
+  build:
+    runs-on: ubuntu-latest # Using ubuntu-latest as a base for all builds
+    strategy:
+      fail-fast: false # Set to false to allow all matrix combinations to complete, even if one fails
+      matrix:
+        # Define the target packaging type.
+        # "archlinux-compatible" will compile and install to a staging directory,
+        # as full Arch package creation usually involves 'makepkg' on an Arch system.
+        packaging_type:
+          - 'debian-based'
+          - 'rpm-based'
+          - 'archlinux-compatible'
+
+    steps:
+    - name: Checkout GitHub Actions Workflow Repository
+      uses: actions/checkout@v4
+      # This checks out the repository containing your workflow file.
+
+    - name: Set up kernel source directory and determine effective branch
+      id: setup-source
+      run: |
+        # Use inputs from workflow_dispatch
+        REPO_URL="${{ github.event.inputs.kernel_source_repo }}"
+        BRANCH="${{ github.event.inputs.branch }}"
+        TARGET_DIR="kernel-source"
+
+        # Determine the effective branch name for caching and logging.
+        # If 'branch' input is empty, fetch the default branch (HEAD) of the remote repository.
+        EFFECTIVE_BRANCH="$BRANCH"
+        if [ -z "$BRANCH" ]; then
+          echo "No specific branch provided. Fetching default branch from $REPO_URL..."
+          # Use git ls-remote to find the default branch (usually 'main' or 'master')
+          DEFAULT_BRANCH=$(git ls-remote --symref "$REPO_URL" HEAD | awk '/HEAD/ {print $1}' | sed 's/refs\/heads\///')
+          EFFECTIVE_BRANCH="$DEFAULT_BRANCH"
+          echo "Using default branch: $EFFECTIVE_BRANCH"
+        else
+          echo "Using specified branch: $EFFECTIVE_BRANCH"
+        fi
+        
+        # Set outputs for subsequent steps to use
+        echo "target_dir=$TARGET_DIR" >> "$GITHUB_OUTPUT"
+        echo "effective_branch=$EFFECTIVE_BRANCH" >> "$GITHUB_OUTPUT"
+
+    - name: Cache the kernel source
+      id: cache-kernel
+      uses: actions/cache@v4
+      with:
+        path: ${{ steps.setup-source.outputs.target_dir }} # Path to cache
+        # Cache key based on OS, kernel repo URL, effective branch, and a hash of the directory content.
+        # The hashFiles part ensures the cache invalidates if the content of the source directory changes.
+        key: ${{ runner.os }}-kernel-source-${{ github.event.inputs.kernel_source_repo }}-${{ steps.setup-source.outputs.effective_branch }}-${{ hashFiles(format('{0}/**', steps.setup-source.outputs.target_dir)) }}
+        # Restore keys for finding a suitable cache if the primary key doesn't match exactly.
+        restore-keys: |
+          ${{ runner.os }}-kernel-source-${{ github.event.inputs.kernel_source_repo }}-${{ steps.setup-source.outputs.effective_branch }}
+          ${{ runner.os }}-kernel-source-
+
+    - name: Clone Kernel Source
+      # Only clone if the cache was not hit
+      if: steps.cache-kernel.outputs.cache-hit != 'true'
+      run: |
+        # Use inputs from workflow_dispatch
+        REPO_URL="${{ github.event.inputs.kernel_source_repo }}"
+        BRANCH="${{ github.event.inputs.branch }}"
+        TARGET_DIR="${{ steps.setup-source.outputs.target_dir }}"
+
+        echo "Cloning $REPO_URL into $TARGET_DIR..."
+        if [ -z "$BRANCH" ]; then
+          # Clone without specifying branch to get the default branch
+          git clone "$REPO_URL" "$TARGET_DIR"
+        else
+          # Clone a specific branch
+          git clone -b "$BRANCH" "$REPO_DIR" "$TARGET_DIR"
+        fi
+        cd "$TARGET_DIR"
+        # Crucial for some kernel trees that use submodules (e.g., for firmware or tools)
+        git submodule update --init --recursive
+
+    - name: Install Build Dependencies (${{ matrix.packaging_type }})
+      run: |
+        echo "Installing build dependencies for ${{ matrix.packaging_type }}..."
+        case "${{ matrix.packaging_type }}" in
+          "debian-based")
+            sudo apt-get update
+            # Common kernel build dependencies for Debian/Ubuntu
+            sudo apt-get install -y build-essential libncurses-dev flex bison libssl-dev libelf-dev dwarves bc rsync
+            ;;
+          "rpm-based")
+            sudo apt-get update
+            # Install common build tools and 'rpm' utility on Ubuntu
+            sudo apt-get install -y build-essential libncurses-dev flex bison libssl-dev libelf-dev dwarves bc rsync rpm
+            # Note: For a truly native RPM build environment, consider using a Fedora/CentOS runner.
+            ;;
+          "archlinux-compatible")
+            sudo apt-get update
+            # Common kernel build dependencies for Arch-like systems
+            sudo apt-get install -y build-essential libncurses-dev flex bison libssl-dev libelf-dev dwarves bc rsync
+            # Note: For a truly native Arch build environment, consider using an Arch Linux runner
+            # and installing 'base-devel' group via pacman.
+            ;;
+        esac
+
+    - name: Clean Kernel Source
+      run: |
+        echo "Cleaning kernel source directory..."
+        cd ${{ steps.setup-source.outputs.target_dir }}
+        make mrproper # Cleans up any previous build artifacts and configuration
+
+    - name: Configure Kernel
+      run: |
+        echo "Configuring kernel..."
+        cd ${{ steps.setup-source.outputs.target_dir }}
+        # If a .config file exists (e.g., from cache), update it with new options.
+        # Otherwise, create a default configuration.
+        if [ -f .config ]; then
+          echo "Found existing .config. Updating with 'make olddefconfig'."
+          make olddefconfig
+        else
+          echo "No existing .config found. Creating 'make defconfig'."
+          make defconfig
+        fi
+
+    - name: Compile Kernel
+      run: |
+        echo "Compiling kernel (this may take a while, depending on kernel size and runner specs)..."
+        cd ${{ steps.setup-source.outputs.target_dir }}
+        # Use all available CPU cores for faster compilation
+        make -j$(nproc)
+
+    - name: Create Packages/Artifacts (${{ matrix.packaging_type }})
+      run: |
+        TARGET_DIR="${{ steps.setup-source.outputs.target_dir }}"
+        mkdir -p artifacts/ # Create a directory to store the final artifacts
+        echo "Creating artifacts for ${{ matrix.packaging_type }}..."
+        cd "$TARGET_DIR"
+        case "${{ matrix.packaging_type }}" in
+          "debian-based")
+            echo "Attempting to create Debian .deb packages..."
+            # 'bindeb-pkg' creates generic Debian packages for image and headers
+            make -j$(nproc) bindeb-pkg
+            # Move the generated .deb files from the parent directory to the artifacts directory
+            mv ../*.deb ../artifacts/ || true # '|| true' prevents failure if no .deb files are found
+            ;;
+          "rpm-based")
+            echo "Attempting to create RPM .rpm packages..."
+            # Ensure the standard rpmbuild directory structure exists
+            mkdir -p ~/rpmbuild/{BUILD,RPMS,SOURCES,SPECS,SRPMS}
+            # 'binrpm-pkg' creates generic RPM packages for image and headers
+            make -j$(nproc) binrpm-pkg
+            # Move the generated .rpm files to the artifacts directory
+            mv ~/rpmbuild/RPMS/x86_64/*.rpm ../artifacts/ || true
+            ;;
+          "archlinux-compatible")
+            echo "Compiling for Arch Linux compatibility. Note: A full .pkg.tar.xz package typically requires a PKGBUILD and 'makepkg' on an Arch system."
+            echo "This step will install the compiled kernel and its modules into a staging directory for inspection."
+            mkdir -p ../artifacts/arch-install
+            # Install kernel image and System.map
+            make install INSTALL_PATH=../artifacts/arch-install
+            # Install kernel modules
+            make modules_install INSTALL_MOD_PATH=../artifacts/arch-install
+            ;;
+        esac
+
+    - name: Upload Kernel Artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        # Name the artifact uniquely based on run ID, packaging type, and effective branch
+        name: kernel-artifacts-${{ github.run_id }}-${{ matrix.packaging_type }}-${{ steps.setup-source.outputs.effective_branch }}
+        path: artifacts/ # Path to the directory containing the generated artifacts
+        retention-days: 7 # Keep artifacts for 7 days
