@@ -49,6 +49,8 @@ jobs:
         EFFECTIVE_BRANCH="$BRANCH"
         if [ -z "$BRANCH" ]; then
           echo "No specific branch provided. 'git clone' will fetch the default branch."
+          # Set a consistent placeholder for the cache key when no explicit branch is given.
+          EFFECTIVE_BRANCH="default-auto-detected"
         else
           echo "Using specified branch: $EFFECTIVE_BRANCH"
         fi
@@ -85,7 +87,7 @@ jobs:
           git clone "$REPO_URL" "$TARGET_DIR"
         else
           # Clone a specific branch
-          git clone -b "$BRANCH" "$REPO_URL" "$TARGET_DIR" # Corrected variable name from $REPO_DIR to $REPO_URL
+          git clone -b "$BRANCH" "$REPO_URL" "$TARGET_DIR"
         fi
         cd "$TARGET_DIR"
         # Crucial for some kernel trees that use submodules (e.g., for firmware or tools)
@@ -97,13 +99,13 @@ jobs:
         case "${{ matrix.packaging_type }}" in
           "debian-based")
             sudo apt-get update
-            # Common kernel build dependencies for Debian/Ubuntu
-            sudo apt-get install -y build-essential libncurses-dev flex bison libssl-dev libelf-dev dwarves bc rsync
+            # Common kernel build dependencies for Debian/Ubuntu, including debhelper
+            sudo apt-get install -y build-essential libncurses-dev flex bison libssl-dev libelf-dev dwarves bc rsync debhelper
             ;;
           "rpm-based")
             sudo apt-get update
-            # Install common build tools and 'rpm' utility on Ubuntu
-            sudo apt-get install -y build-essential libncurses-dev flex bison libssl-dev libelf-dev dwarves bc rsync rpm
+            # Install common build tools and 'rpm' utility on Ubuntu. 'rpm' package provides rpmbuild.
+            sudo apt-get install -y build-essential libncurses-dev flex bison libssl-dev libelf-dev dwarves bc rsync rpm fakeroot
             ;;
           "archlinux-compatible")
             sudo apt-get update
@@ -141,6 +143,7 @@ jobs:
 
     - name: Create Packages/Artifacts (${{ matrix.packaging_type }})
       run: |
+        set -x # Enable debugging output for this step
         TARGET_DIR="${{ steps.setup-source.outputs.target_dir }}"
         mkdir -p artifacts/ # Create a directory to store the final artifacts
         echo "Creating artifacts for ${{ matrix.packaging_type }}..."
@@ -149,27 +152,51 @@ jobs:
           "debian-based")
             echo "Attempting to create Debian .deb packages..."
             # 'bindeb-pkg' creates generic Debian packages for image and headers
-            make -j$(nproc) bindeb-pkg
+            make -j$(nproc) bindeb-pkg || { echo "make bindeb-pkg failed!"; exit 1; }
             # Move the generated .deb files from the parent directory to the artifacts directory
             mv ../*.deb ../artifacts/ || true # '|| true' prevents failure if no .deb files are found
             ;;
           "rpm-based")
             echo "Attempting to create RPM .rpm packages..."
+            # Verify rpmbuild is available
+            if ! command -v rpmbuild &> /dev/null
+            then
+                echo "rpmbuild command not found. Please ensure 'rpm' package is installed and provides rpmbuild."
+                exit 1
+            fi
             # Ensure the standard rpmbuild directory structure exists
             mkdir -p ~/rpmbuild/{BUILD,RPMS,SOURCES,SPECS,SRPMS}
+            echo "Contents of ~/rpmbuild before build:"
+            ls -lR ~/rpmbuild/
             # 'binrpm-pkg' creates generic RPM packages for image and headers
-            make -j$(nproc) binrpm-pkg
-            # Move the generated .rpm files to the artifacts directory
-            mv ~/rpmbuild/RPMS/x86_64/*.rpm ../artifacts/ || true
+            make -j$(nproc) binrpm-pkg || { echo "make binrpm-pkg failed!"; exit 1; }
+            echo "Contents of ~/rpmbuild/RPMS/x86_64/ after build:"
+            ls -l ~/rpmbuild/RPMS/x86_64/ || true # Use || true in case directory doesn't exist yet
+            
+            echo "Contents of current directory (kernel source) after build:"
+            ls -l *.rpm || true # Check for RPMs directly in the kernel source root
+            ls -lR . # List all contents of the current directory
+
+            echo "Contents of parent directory (workspace) after build:"
+            ls -l ../*.rpm || true # Check for RPMs in the parent directory
+            ls -lR ../ # List all contents of the parent directory
+
+            # Attempt to move .rpm files from both standard rpmbuild location and parent directory
+            find ~/rpmbuild/RPMS/x86_64/ -name "*.rpm" -exec mv {} ../artifacts/ \; || true
+            find ../ -maxdepth 1 -name "*.rpm" -exec mv {} ../artifacts/ \; || true # Check parent directory
+            find . -maxdepth 1 -name "*.rpm" -exec mv {} ../artifacts/ \; || true # Check current directory
+
+            echo "Contents of artifacts/ after move attempts:"
+            ls -l ../artifacts/
             ;;
           "archlinux-compatible")
             echo "Compiling for Arch Linux compatibility. Note: A full .pkg.tar.xz package typically requires a PKGBUILD and 'makepkg' on an Arch system."
             echo "This step will install the compiled kernel and its modules into a staging directory for inspection."
             mkdir -p ../artifacts/arch-install
             # Install kernel image and System.map
-            make install INSTALL_PATH=../artifacts/arch-install
+            make install INSTALL_PATH=../artifacts/arch-install || { echo "make install failed!"; exit 1; }
             # Install kernel modules
-            make modules_install INSTALL_MOD_PATH=../artifacts/arch-install
+            make modules_install INSTALL_MOD_PATH=../artifacts/arch-install || { echo "make modules_install failed!"; exit 1; }
             ;;
         esac
 
